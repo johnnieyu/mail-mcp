@@ -4,10 +4,14 @@
 //! stdio, for deployments where the server runs on another host and is reached
 //! through an MCP gateway. Enabled with `MAIL_MCP_TRANSPORT=http`.
 //!
-//! The endpoint has **no authentication of its own**. It binds to loopback by
-//! default; bind it anywhere else only behind something that authenticates
+//! The endpoint has **no authentication of its own** unless
+//! `MAIL_MCP_HTTP_TOKEN` is set, in which case every request must carry
+//! `Authorization: Bearer <token>`. It binds to loopback by default; bind it
+//! anywhere else only with a token or behind something that authenticates
 //! callers (an MCP gateway, a reverse proxy with auth, a firewall that admits
-//! only the gateway).
+//! only the gateway). Off loopback, `MAIL_MCP_HTTP_ALLOWED_HOSTS` (comma
+//! separated) lists the Host headers to accept; rmcp accepts only loopback
+//! hosts by default, against DNS rebinding.
 //!
 //! The service runs in stateless mode: every request gets a clone of one
 //! server instance, so the shared state behind its `Arc`s (the pagination
@@ -59,6 +63,10 @@ fn parse_transport(raw: &str) -> Result<Transport, String> {
 pub struct HttpSettings {
     pub addr: SocketAddr,
     pub path: String,
+    /// Host headers to accept; empty keeps rmcp's loopback-only default.
+    pub allowed_hosts: Vec<String>,
+    /// Bearer token every request must carry; `None` means no check.
+    pub token: Option<String>,
 }
 
 impl HttpSettings {
@@ -66,11 +74,14 @@ impl HttpSettings {
     /// (default `8000`) and `MAIL_MCP_HTTP_PATH` (default `/mcp`).
     pub fn from_env() -> Result<Self, String> {
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        parse_settings(
+        let mut settings = parse_settings(
             get("MAIL_MCP_HTTP_HOST").as_deref(),
             get("MAIL_MCP_HTTP_PORT").as_deref(),
             get("MAIL_MCP_HTTP_PATH").as_deref(),
-        )
+        )?;
+        settings.allowed_hosts = parse_hosts(get("MAIL_MCP_HTTP_ALLOWED_HOSTS").as_deref());
+        settings.token = get("MAIL_MCP_HTTP_TOKEN").map(|t| t.trim().to_string());
+        Ok(settings)
     }
 }
 
@@ -103,7 +114,28 @@ fn parse_settings(
     Ok(HttpSettings {
         addr,
         path: path.to_string(),
+        allowed_hosts: Vec::new(),
+        token: None,
     })
+}
+
+fn parse_hosts(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// True when `header` is `Bearer <token>`. Compares in constant time over the
+/// token's length.
+fn bearer_matches(header: Option<&str>, token: &str) -> bool {
+    let Some(given) = header.and_then(|h| h.strip_prefix("Bearer ")) else {
+        return false;
+    };
+    let (a, b) = (given.trim().as_bytes(), token.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Serve `server` over streamable HTTP until SIGINT or SIGTERM.
@@ -119,15 +151,37 @@ pub async fn serve(server: MailImapServer, settings: HttpSettings) -> Result<(),
             let mut config = StreamableHttpServerConfig::default();
             config.legacy_session_mode = false;
             config.cancellation_token = shutdown.clone();
+            if !settings.allowed_hosts.is_empty() {
+                config.allowed_hosts = settings.allowed_hosts.clone();
+            }
             config
         },
     );
-    let router = axum::Router::new().route_service(&settings.path, service);
+    let mut router = axum::Router::new().route_service(&settings.path, service);
+    if let Some(token) = settings.token.clone() {
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let token = token.clone();
+                async move {
+                    let header = req
+                        .headers()
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok());
+                    if bearer_matches(header, &token) {
+                        next.run(req).await
+                    } else {
+                        axum::response::IntoResponse::into_response(axum::http::StatusCode::UNAUTHORIZED)
+                    }
+                }
+            },
+        ));
+    }
     let listener = tokio::net::TcpListener::bind(settings.addr).await?;
     tracing::info!(
-        "listening on http://{}{} (no built-in auth; keep it behind a gateway)",
+        "listening on http://{}{} ({})",
         settings.addr,
-        settings.path
+        settings.path,
+        if settings.token.is_some() { "bearer token required" } else { "no built-in auth; keep it behind a gateway" }
     );
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -187,6 +241,21 @@ mod tests {
         assert_eq!(s.path, "/");
         let v6 = parse_settings(Some("::"), Some("9000"), None).unwrap();
         assert_eq!(v6.addr, "[::]:9000".parse().unwrap());
+    }
+
+    #[test]
+    fn hosts_split_on_commas() {
+        assert!(parse_hosts(None).is_empty());
+        assert_eq!(parse_hosts(Some(" a.internal , b:8000,,")), vec!["a.internal", "b:8000"]);
+    }
+
+    #[test]
+    fn bearer_needs_the_exact_token() {
+        assert!(bearer_matches(Some("Bearer s3cret"), "s3cret"));
+        assert!(!bearer_matches(Some("Bearer s3cre"), "s3cret"));
+        assert!(!bearer_matches(Some("Bearer s3creT"), "s3cret"));
+        assert!(!bearer_matches(Some("s3cret"), "s3cret"));
+        assert!(!bearer_matches(None, "s3cret"));
     }
 
     #[test]

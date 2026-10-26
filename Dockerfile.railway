@@ -1,0 +1,50 @@
+# Build Stage 1: Planner
+# NOTE: the codebase uses edition-2024 let-chains, which require Rust >= 1.88.
+FROM lukemathwalker/cargo-chef:latest-rust-1.90-alpine AS chef
+# Install build dependencies
+RUN apk add --no-cache musl-dev
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Build Stage 2: Builder
+FROM chef AS builder
+# Use TARGETARCH to determine the correct binary path for both native and cross-builds
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+    "amd64") echo "x86_64-unknown-linux-musl" > /target.txt ;; \
+    "arm64") echo "aarch64-unknown-linux-musl" > /target.txt ;; \
+    *) echo "x86_64-unknown-linux-musl" > /target.txt ;; \
+    esac
+
+# Pre-install the rust target
+RUN rustup target add $(cat /target.txt)
+
+COPY --from=planner /app/recipe.json recipe.json
+# Build dependencies - cached layer
+RUN cargo chef cook --release --target $(cat /target.txt) --recipe-path recipe.json
+
+# Copy source and build the application
+COPY . .
+RUN cargo build --release --bin mail-mcp --target $(cat /target.txt) && \
+    cp target/$(cat /target.txt)/release/mail-mcp /mail-mcp-bin
+
+# Final Stage: Runtime (Railway, johnnieyu fork)
+# The upstream image is FROM scratch and speaks stdio. This one serves
+# streamable HTTP on Railway's private network and takes its secrets from
+# Doppler: the container holds only DOPPLER_TOKEN (a read-only service token
+# for one config), and `doppler run` injects the accounts at start.
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates
+COPY --from=dopplerhq/cli:3 /bin/doppler /usr/local/bin/doppler
+COPY --from=builder /mail-mcp-bin /usr/local/bin/mail-mcp
+RUN adduser -D -H mail
+USER mail
+ENV HOME=/tmp \
+    MAIL_MCP_TRANSPORT=http \
+    MAIL_MCP_HTTP_HOST=:: \
+    MAIL_MCP_HTTP_PORT=8000
+EXPOSE 8000
+CMD ["doppler", "run", "--no-check-version", "--", "mail-mcp"]
